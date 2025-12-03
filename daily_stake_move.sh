@@ -122,6 +122,8 @@ error_exit() {
     local telegram_msg="❌ <b>Stake Move Failed</b>
 
 Date: $(date '+%Y-%m-%d %H:%M:%S %Z')
+Origin Hotkey: <code>$ORIGIN_HOTKEY</code>
+Destination Hotkey: <code>$DEST_HOTKEY</code>
 Error: $error_msg
 
 Please check the logs for more details."
@@ -144,8 +146,8 @@ log "Wallet: $WALLET_NAME"
 START_MSG="🚀 <b>Daily Stake Move Started</b>
 
 Date: $(date '+%Y-%m-%d %H:%M:%S %Z')
-Origin Hotkey: <code>${ORIGIN_HOTKEY:0:20}...</code>
-Destination Hotkey: <code>${DEST_HOTKEY:0:20}...</code>
+Origin Hotkey: <code>$ORIGIN_HOTKEY</code>
+Destination Hotkey: <code>$DEST_HOTKEY</code>
 Wallet: $WALLET_NAME"
 send_telegram "$START_MSG"
 
@@ -247,8 +249,8 @@ if [ -f "$OUTPUT_FILE" ]; then
 Date: $(date '+%Y-%m-%d %H:%M:%S %Z')
 Origin Stake: <b>$ORIGIN_AMOUNT</b>
 Destination Stake: <b>$DEST_AMOUNT</b>
-Origin Hotkey: <code>${ORIGIN_HOTKEY:0:20}...</code>
-Destination Hotkey: <code>${DEST_HOTKEY:0:20}...</code>"
+Origin Hotkey: <code>$ORIGIN_HOTKEY</code>
+Destination Hotkey: <code>$DEST_HOTKEY</code>"
     send_telegram "$SUCCESS_MSG"
 else
     log "Warning: Could not parse output file"
@@ -259,6 +261,8 @@ else
 
 Date: $(date '+%Y-%m-%d %H:%M:%S %Z')
 Status: Completed (amounts not parsed)
+Origin Hotkey: <code>$ORIGIN_HOTKEY</code>
+Destination Hotkey: <code>$DEST_HOTKEY</code>
 Please check logs for details."
     send_telegram "$SUCCESS_MSG"
 fi

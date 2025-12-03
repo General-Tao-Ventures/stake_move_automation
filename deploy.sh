@@ -148,6 +148,20 @@ sed -i "s|WorkingDirectory=.*|WorkingDirectory=$INSTALL_DIR|" /etc/systemd/syste
 sed -i "s|ExecStart=.*|ExecStart=$INSTALL_DIR/daily_stake_move.sh|" /etc/systemd/system/stake-move.service
 sed -i "s|^User=.*|User=$SERVICE_USER|" /etc/systemd/system/stake-move.service
 
+# Update PATH to include common locations for btcli (pip installs to ~/.local/bin)
+USER_HOME=$(getent passwd "$SERVICE_USER" | cut -d: -f6)
+if [ -n "$USER_HOME" ] && [ "$SERVICE_USER" != "root" ]; then
+    # Add user's local bin and common Python paths
+    UPDATED_PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:$USER_HOME/.local/bin:$USER_HOME/.cargo/bin"
+    # Check if PATH line exists, if not add it
+    if ! grep -q "^Environment=\"PATH=" /etc/systemd/system/stake-move.service; then
+        sed -i "/^\[Service\]/a Environment=\"PATH=$UPDATED_PATH\"" /etc/systemd/system/stake-move.service
+    else
+        sed -i "s|^Environment=\"PATH=.*|Environment=\"PATH=$UPDATED_PATH\"|" /etc/systemd/system/stake-move.service
+    fi
+    log_info "Updated PATH in service file to include $USER_HOME/.local/bin"
+fi
+
 # Set up Application Default Credentials path if not root
 if [ "$SERVICE_USER" != "root" ]; then
     USER_HOME=$(getent passwd "$SERVICE_USER" | cut -d: -f6)
