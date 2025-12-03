@@ -87,6 +87,35 @@ log_info "Creating installation directory: $INSTALL_DIR"
 mkdir -p "$INSTALL_DIR"
 mkdir -p /var/log/stake-move
 
+# Determine the user who will run the service (prefer SUDO_USER, fallback to current user)
+SERVICE_USER="${SUDO_USER:-$USER}"
+if [ "$SERVICE_USER" = "root" ] || [ -z "$SERVICE_USER" ]; then
+    # If running as root without sudo, try to find a non-root user
+    SERVICE_USER=$(getent passwd | awk -F: '$3 >= 1000 && $1 != "nobody" {print $1; exit}')
+    if [ -z "$SERVICE_USER" ]; then
+        SERVICE_USER="root"
+    fi
+fi
+
+# Set proper permissions for log directory (service user needs write access)
+log_info "Setting permissions for log directory (user: $SERVICE_USER)..."
+if chown -R "$SERVICE_USER:$SERVICE_USER" /var/log/stake-move 2>/dev/null; then
+    chmod 755 /var/log/stake-move
+    log_info "Log directory ownership set to $SERVICE_USER"
+else
+    # If chown fails (e.g., directory owned by root), make it writable by the user
+    chmod 775 /var/log/stake-move
+    # Try to use ACLs if available, otherwise the user will need sudo to write
+    if command -v setfacl &>/dev/null; then
+        setfacl -m "u:$SERVICE_USER:rwx" /var/log/stake-move 2>/dev/null && \
+        setfacl -d -m "u:$SERVICE_USER:rwx" /var/log/stake-move 2>/dev/null && \
+        log_info "Log directory ACLs set for $SERVICE_USER"
+    else
+        log_warn "Could not set ownership. You may need to manually fix permissions:"
+        log_warn "  sudo chown -R $SERVICE_USER:$SERVICE_USER /var/log/stake-move"
+    fi
+fi
+
 # Copy scripts to installation directory
 log_info "Copying scripts to $INSTALL_DIR..."
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -98,22 +127,21 @@ log_info "Installing systemd service and timer..."
 cp "$SCRIPT_DIR/stake-move.service" /etc/systemd/system/
 cp "$SCRIPT_DIR/stake-move.timer" /etc/systemd/system/
 
-# Determine the user who will run the service (prefer SUDO_USER, fallback to current user)
-SERVICE_USER="${SUDO_USER:-$USER}"
-if [ "$SERVICE_USER" = "root" ] || [ -z "$SERVICE_USER" ]; then
-    # If running as root without sudo, try to find a non-root user
-    SERVICE_USER=$(getent passwd | awk -F: '$3 >= 1000 && $1 != "nobody" {print $1; exit}')
-    if [ -z "$SERVICE_USER" ]; then
-        SERVICE_USER="root"
-        log_warn "Could not determine non-root user, service will run as root"
-        log_warn "You may need to set up Application Default Credentials for root:"
-        log_warn "  sudo gcloud auth application-default login"
-    else
-        log_info "Detected service user: $SERVICE_USER"
+# SERVICE_USER should already be set from above
+if [ -z "${SERVICE_USER:-}" ]; then
+    SERVICE_USER="${SUDO_USER:-$USER}"
+    if [ "$SERVICE_USER" = "root" ] || [ -z "$SERVICE_USER" ]; then
+        SERVICE_USER=$(getent passwd | awk -F: '$3 >= 1000 && $1 != "nobody" {print $1; exit}')
+        if [ -z "$SERVICE_USER" ]; then
+            SERVICE_USER="root"
+            log_warn "Could not determine non-root user, service will run as root"
+            log_warn "You may need to set up Application Default Credentials for root:"
+            log_warn "  sudo gcloud auth application-default login"
+        fi
     fi
-else
-    log_info "Service will run as user: $SERVICE_USER"
 fi
+
+log_info "Service will run as user: $SERVICE_USER"
 
 # Update service file with correct paths and user
 sed -i "s|WorkingDirectory=.*|WorkingDirectory=$INSTALL_DIR|" /etc/systemd/system/stake-move.service
