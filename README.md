@@ -112,10 +112,21 @@ To receive notifications and daily logs via Telegram:
    - Save the bot token (e.g., `123456789:ABCdefGHIjklMNOpqrsTUVwxyz`)
 
 2. **Get Your Chat ID**:
+   
+   **Option A: Private Chat (Personal)**
    - Search for your bot in Telegram and start a conversation
    - Send any message to your bot
    - Visit: `https://api.telegram.org/bot<YOUR_BOT_TOKEN>/getUpdates`
    - Find your chat ID in the response (look for `"chat":{"id":123456789}`)
+   
+   **Option B: Group Chat (Recommended for notifications)**
+   - Create a Telegram group or use an existing one
+   - Add your bot to the group as a member (or admin)
+   - Send a message in the group (e.g., "Hello")
+   - Visit: `https://api.telegram.org/bot<YOUR_BOT_TOKEN>/getUpdates`
+   - Find the group chat ID in the response (look for `"chat":{"id":-1001234567890}`)
+   - **Note**: Group chat IDs are negative numbers (e.g., `-1003492410161`)
+   - Make sure the bot has permission to send messages in the group
 
 3. **Store credentials** (will be prompted during deployment, or manually):
    ```bash
