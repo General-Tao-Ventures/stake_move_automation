@@ -159,10 +159,8 @@ if [ $? -ne 0 ]; then
 fi
 log "Password retrieved successfully"
 
-# Capture initial stake amounts (if possible)
-log "Checking current stake amounts..."
-INITIAL_OUTPUT=$(btcli stake show --netuid "$ORIGIN_NETUID" --wallet.name "$WALLET_NAME" --hotkey.ss58 "$ORIGIN_HOTKEY" 2>&1 || true)
-log "Initial stake check output: $INITIAL_OUTPUT"
+# Note: Initial stake amounts will be shown in the stake move output
+log "Starting stake move operation..."
 
 # Perform the stake move
 log "Executing stake move operation..."
@@ -196,18 +194,14 @@ expect {
         puts \$log_file "SUCCESS: Stake move completed"
         exp_continue
     }
-    "Origin Netuid:" {
+    -re "Origin stake:.*?(\[0-9,\]+\.\[0-9\]+)" {
+        set origin_stake [regsub -all {,} \$expect_out(1,string) {}]
+        puts \$log_file "ORIGIN_STAKE: \$origin_stake"
         exp_continue
     }
-    "Origin stake:" {
-        puts \$log_file "ORIGIN_STAKE: \$expect_out(buffer)"
-        exp_continue
-    }
-    "Destination netuid:" {
-        exp_continue
-    }
-    "Destination stake:" {
-        puts \$log_file "DEST_STAKE: \$expect_out(buffer)"
+    -re "Destination stake:.*?(\[0-9,\]+\.\[0-9\]+)" {
+        set dest_stake [regsub -all {,} \$expect_out(1,string) {}]
+        puts \$log_file "DEST_STAKE: \$dest_stake"
         exp_continue
     }
     eof {
@@ -222,33 +216,55 @@ expect {
 wait
 EOF
 
-if ! expect "$EXPECT_SCRIPT" >> "$LOG_FILE" 2>&1; then
+# Capture full output for parsing fallback
+FULL_OUTPUT_FILE=$(mktemp)
+if ! expect "$EXPECT_SCRIPT" > "$FULL_OUTPUT_FILE" 2>&1; then
+    cat "$FULL_OUTPUT_FILE" >> "$LOG_FILE"
+    rm -f "$EXPECT_SCRIPT" "$OUTPUT_FILE" "$FULL_OUTPUT_FILE"
     error_exit "Stake move operation failed. Check logs for details."
 fi
 
-# Parse output for stake amounts
+# Append full output to log file
+cat "$FULL_OUTPUT_FILE" >> "$LOG_FILE"
+
+# Parse output for stake amounts from btcli stake move output
+ORIGIN_AMOUNT="N/A"
+DEST_AMOUNT="N/A"
+
+# First try to extract from expect captured values (already has commas removed)
 if [ -f "$OUTPUT_FILE" ]; then
-    ORIGIN_STAKE=$(grep -i "origin stake" "$OUTPUT_FILE" | tail -1 || echo "N/A")
-    DEST_STAKE=$(grep -i "destination stake" "$OUTPUT_FILE" | tail -1 || echo "N/A")
-    
-    log "Operation completed successfully"
-    log "Origin stake info: $ORIGIN_STAKE"
-    log "Destination stake info: $DEST_STAKE"
-    
-    # Try to extract numeric values for summary
-    ORIGIN_AMOUNT=$(echo "$ORIGIN_STAKE" | grep -oE '[0-9,]+\.?[0-9]*' | head -1 || echo "N/A")
-    DEST_AMOUNT=$(echo "$DEST_STAKE" | grep -oE '[0-9,]+\.?[0-9]*' | head -1 || echo "N/A")
+    ORIGIN_AMOUNT=$(grep "^ORIGIN_STAKE:" "$OUTPUT_FILE" | sed 's/ORIGIN_STAKE: //' | tail -1 | tr -d ' ' || echo "")
+    DEST_AMOUNT=$(grep "^DEST_STAKE:" "$OUTPUT_FILE" | sed 's/DEST_STAKE: //' | tail -1 | tr -d ' ' || echo "")
+fi
+
+# Fallback: parse from full output if expect capture failed
+# Match pattern: "Origin stake: 2,924.0256 ך" -> extract "2,924.0256" -> remove commas -> "2924.0256"
+if [ -z "$ORIGIN_AMOUNT" ] || [ "$ORIGIN_AMOUNT" = "N/A" ]; then
+    ORIGIN_AMOUNT=$(grep -i "Origin stake:" "$FULL_OUTPUT_FILE" 2>/dev/null | \
+        sed -n 's/.*Origin stake:[[:space:]]*\([0-9,]\+\.[0-9]*\).*/\1/p' | \
+        head -1 | tr -d ',' || echo "N/A")
+fi
+
+if [ -z "$DEST_AMOUNT" ] || [ "$DEST_AMOUNT" = "N/A" ]; then
+    DEST_AMOUNT=$(grep -i "Destination stake:" "$FULL_OUTPUT_FILE" 2>/dev/null | \
+        sed -n 's/.*Destination stake:[[:space:]]*\([0-9,]\+\.[0-9]*\).*/\1/p' | \
+        head -1 | tr -d ',' || echo "N/A")
+fi
+
+log "Operation completed successfully"
+log "Origin stake amount (moved): $ORIGIN_AMOUNT"
+log "Destination stake amount (current total): $DEST_AMOUNT"
     
     log_summary "SUCCESS: Stake moved from $ORIGIN_HOTKEY to $DEST_HOTKEY"
-    log_summary "  Origin stake: $ORIGIN_AMOUNT"
-    log_summary "  Destination stake: $DEST_AMOUNT"
+    log_summary "  Stake moved: $ORIGIN_AMOUNT ך"
+    log_summary "  Destination total: $DEST_AMOUNT ך"
     
     # Send success notification to Telegram
     SUCCESS_MSG="✅ <b>Stake Move Completed Successfully</b>
 
 Date: $(date '+%Y-%m-%d %H:%M:%S %Z')
-Origin Stake: <b>$ORIGIN_AMOUNT</b>
-Destination Stake: <b>$DEST_AMOUNT</b>
+Stake Moved: <b>$ORIGIN_AMOUNT ך</b>
+Destination Total: <b>$DEST_AMOUNT ך</b>
 Origin Hotkey: <code>$ORIGIN_HOTKEY</code>
 Destination Hotkey: <code>$DEST_HOTKEY</code>"
     send_telegram "$SUCCESS_MSG"
@@ -268,12 +284,12 @@ Please check logs for details."
 fi
 
 # Cleanup
-rm -f "$EXPECT_SCRIPT" "$OUTPUT_FILE"
+rm -f "$EXPECT_SCRIPT" "$OUTPUT_FILE" "$FULL_OUTPUT_FILE"
 
-# Verify final state
+# Verify final state using stake list
 log "Verifying final stake state..."
-FINAL_OUTPUT=$(btcli stake show --netuid "$DEST_NETUID" --wallet.name "$WALLET_NAME" --hotkey.ss58 "$DEST_HOTKEY" 2>&1 || true)
-log "Final stake check output: $FINAL_OUTPUT"
+FINAL_OUTPUT=$(btcli stake list --netuid "$DEST_NETUID" --wallet.name "$WALLET_NAME" 2>&1 | grep -A 10 "$DEST_HOTKEY" | grep -i "Stake (α)" | head -1 || echo "Could not retrieve final stake details")
+log "Final stake verification: $FINAL_OUTPUT"
 
 log "=========================================="
 log "Daily stake move operation completed"
