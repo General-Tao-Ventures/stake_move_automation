@@ -227,13 +227,32 @@ NEXT_RUN=$(systemctl list-timers stake-move.timer --no-pager | grep stake-move.t
 log_info "Next scheduled run: $NEXT_RUN"
 
 # Test run option
+log_info ""
+log_info "You can test the automation now, or wait for the scheduled run at 8AM PST."
 read -p "Do you want to run a test execution now? (y/N): " -n 1 -r
 echo
 if [[ $REPLY =~ ^[Yy]$ ]]; then
     log_info "Running test execution..."
+    log_info "This will perform an actual stake move operation!"
     systemctl start stake-move.service
-    sleep 2
-    journalctl -u stake-move.service -n 50 --no-pager
+    
+    # Wait a bit for the service to start
+    sleep 3
+    
+    # Show recent logs
+    log_info "Recent service logs:"
+    journalctl -u stake-move.service -n 50 --no-pager || true
+    
+    log_info ""
+    log_info "To follow the logs in real-time, run:"
+    log_info "  journalctl -u stake-move.service -f"
+    log_info ""
+    log_info "To view the daily log file:"
+    log_info "  tail -f /var/log/stake-move/\$(date +%Y-%m-%d).log"
+else
+    log_info "Skipping test run. The automation will run automatically at 8AM PST daily."
+    log_info "To manually trigger a test run later, use:"
+    log_info "  sudo systemctl start stake-move.service"
 fi
 
 log_info "=========================================="
