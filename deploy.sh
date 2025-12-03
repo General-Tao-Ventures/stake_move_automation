@@ -102,91 +102,190 @@ cp "$SCRIPT_DIR/stake-move.timer" /etc/systemd/system/
 sed -i "s|WorkingDirectory=.*|WorkingDirectory=$INSTALL_DIR|" /etc/systemd/system/stake-move.service
 sed -i "s|ExecStart=.*|ExecStart=$INSTALL_DIR/daily_stake_move.sh|" /etc/systemd/system/stake-move.service
 
+# Function to mask secret value for display
+mask_secret() {
+    local secret="$1"
+    local len=${#secret}
+    if [ $len -le 8 ]; then
+        echo "****"
+    elif [ $len -le 16 ]; then
+        echo "${secret:0:4}****${secret: -4}"
+    else
+        echo "${secret:0:6}****${secret: -6}"
+    fi
+}
+
 # Set up GCP Secret Manager
 log_info "Setting up GCP Secret Manager secret: $SECRET_NAME"
 
-# Check if secret exists
-if gcloud secrets describe "$SECRET_NAME" --project="$PROJECT_ID" &>/dev/null; then
-    log_info "Secret $SECRET_NAME already exists"
-    read -p "Do you want to update the secret? (y/N): " -n 1 -r
+# Check if secret exists (use the actual user's gcloud config, not root's)
+# Try to access the secret - if it works, it exists
+if sudo -u "$SUDO_USER" gcloud secrets describe "$SECRET_NAME" --project="$PROJECT_ID" &>/dev/null 2>&1 || \
+   gcloud secrets describe "$SECRET_NAME" --project="$PROJECT_ID" &>/dev/null 2>&1; then
+    log_info "Secret $SECRET_NAME already exists - skipping creation"
+    
+    # Try to retrieve and show masked value
+    SECRET_VALUE=""
+    if [ -n "${SUDO_USER:-}" ]; then
+        SECRET_VALUE=$(sudo -u "$SUDO_USER" gcloud secrets versions access latest --secret="$SECRET_NAME" --project="$PROJECT_ID" 2>/dev/null || echo "")
+    else
+        SECRET_VALUE=$(gcloud secrets versions access latest --secret="$SECRET_NAME" --project="$PROJECT_ID" 2>/dev/null || echo "")
+    fi
+    
+    if [ -n "$SECRET_VALUE" ]; then
+        MASKED=$(mask_secret "$SECRET_VALUE")
+        log_info "  Current value: $MASKED"
+    else
+        log_warn "  Could not retrieve secret value (may need permissions)"
+    fi
+    
+    log_info "To update the secret later, run:"
+    log_info "  echo -n 'NEW_PASSWORD' | gcloud secrets versions add $SECRET_NAME --data-file=- --project=$PROJECT_ID"
+else
+    log_info "Secret $SECRET_NAME does not exist"
+    read -p "Do you want to create it now? (y/N): " -n 1 -r
     echo
     if [[ $REPLY =~ ^[Yy]$ ]]; then
-        read -sp "Enter wallet password: " PASSWORD
+        read -sp "Enter wallet password for $SECRET_NAME: " PASSWORD
         echo
-        echo -n "$PASSWORD" | gcloud secrets versions add "$SECRET_NAME" \
-            --data-file=- \
-            --project="$PROJECT_ID"
-        log_info "Secret updated successfully"
+        # Use the actual user's gcloud credentials
+        if [ -n "${SUDO_USER:-}" ]; then
+            sudo -u "$SUDO_USER" bash -c "echo -n '$PASSWORD' | gcloud secrets create $SECRET_NAME --data-file=- --project=$PROJECT_ID --replication-policy=automatic"
+        else
+            echo -n "$PASSWORD" | gcloud secrets create "$SECRET_NAME" \
+                --data-file=- \
+                --project="$PROJECT_ID" \
+                --replication-policy="automatic"
+        fi
+        log_info "Secret created successfully"
+    else
+        log_warn "Skipping secret creation. Make sure the secret exists before running the automation."
     fi
-else
-    log_info "Creating new secret: $SECRET_NAME"
-    read -sp "Enter wallet password for $SECRET_NAME: " PASSWORD
-    echo
-    echo -n "$PASSWORD" | gcloud secrets create "$SECRET_NAME" \
-        --data-file=- \
-        --project="$PROJECT_ID" \
-        --replication-policy="automatic"
-    log_info "Secret created successfully"
 fi
 
 # Set up Telegram secrets (optional)
 log_info ""
 log_info "Setting up Telegram notifications (optional)..."
-read -p "Do you want to configure Telegram notifications? (y/N): " -n 1 -r
-echo
-if [[ $REPLY =~ ^[Yy]$ ]]; then
-    # Telegram Bot Token
-    if gcloud secrets describe "$TELEGRAM_BOT_TOKEN_SECRET" --project="$PROJECT_ID" &>/dev/null; then
-        log_info "Telegram bot token secret already exists"
-        read -p "Do you want to update it? (y/N): " -n 1 -r
-        echo
-        if [[ $REPLY =~ ^[Yy]$ ]]; then
-            read -p "Enter Telegram bot token: " BOT_TOKEN
-            echo -n "$BOT_TOKEN" | gcloud secrets versions add "$TELEGRAM_BOT_TOKEN_SECRET" \
-                --data-file=- \
-                --project="$PROJECT_ID"
-            log_info "Telegram bot token updated"
-        fi
+
+# Check if Telegram secrets already exist
+TELEGRAM_BOT_EXISTS=false
+TELEGRAM_CHAT_EXISTS=false
+
+if (sudo -u "${SUDO_USER:-root}" gcloud secrets describe "$TELEGRAM_BOT_TOKEN_SECRET" --project="$PROJECT_ID" &>/dev/null 2>&1) || \
+   (gcloud secrets describe "$TELEGRAM_BOT_TOKEN_SECRET" --project="$PROJECT_ID" &>/dev/null 2>&1); then
+    TELEGRAM_BOT_EXISTS=true
+fi
+
+if (sudo -u "${SUDO_USER:-root}" gcloud secrets describe "$TELEGRAM_CHAT_ID_SECRET" --project="$PROJECT_ID" &>/dev/null 2>&1) || \
+   (gcloud secrets describe "$TELEGRAM_CHAT_ID_SECRET" --project="$PROJECT_ID" &>/dev/null 2>&1); then
+    TELEGRAM_CHAT_EXISTS=true
+fi
+
+if [ "$TELEGRAM_BOT_EXISTS" = true ] && [ "$TELEGRAM_CHAT_EXISTS" = true ]; then
+    log_info "Telegram secrets already exist - skipping configuration"
+    log_info "Bot token secret: $TELEGRAM_BOT_TOKEN_SECRET ✓"
+    
+    # Show masked bot token
+    BOT_TOKEN_VALUE=""
+    if [ -n "${SUDO_USER:-}" ]; then
+        BOT_TOKEN_VALUE=$(sudo -u "$SUDO_USER" gcloud secrets versions access latest --secret="$TELEGRAM_BOT_TOKEN_SECRET" --project="$PROJECT_ID" 2>/dev/null || echo "")
     else
-        read -p "Enter Telegram bot token: " BOT_TOKEN
-        echo -n "$BOT_TOKEN" | gcloud secrets create "$TELEGRAM_BOT_TOKEN_SECRET" \
-            --data-file=- \
-            --project="$PROJECT_ID" \
-            --replication-policy="automatic"
-        log_info "Telegram bot token secret created"
+        BOT_TOKEN_VALUE=$(gcloud secrets versions access latest --secret="$TELEGRAM_BOT_TOKEN_SECRET" --project="$PROJECT_ID" 2>/dev/null || echo "")
+    fi
+    if [ -n "$BOT_TOKEN_VALUE" ]; then
+        MASKED_BOT=$(mask_secret "$BOT_TOKEN_VALUE")
+        log_info "  Bot token: $MASKED_BOT"
     fi
     
-    # Telegram Chat ID
-    if gcloud secrets describe "$TELEGRAM_CHAT_ID_SECRET" --project="$PROJECT_ID" &>/dev/null; then
-        log_info "Telegram chat ID secret already exists"
-        read -p "Do you want to update it? (y/N): " -n 1 -r
-        echo
-        if [[ $REPLY =~ ^[Yy]$ ]]; then
-            read -p "Enter Telegram chat ID: " CHAT_ID
-            echo -n "$CHAT_ID" | gcloud secrets versions add "$TELEGRAM_CHAT_ID_SECRET" \
-                --data-file=- \
-                --project="$PROJECT_ID"
-            log_info "Telegram chat ID updated"
-        fi
+    log_info "Chat ID secret: $TELEGRAM_CHAT_ID_SECRET ✓"
+    
+    # Show chat ID (can show full value as it's not sensitive)
+    CHAT_ID_VALUE=""
+    if [ -n "${SUDO_USER:-}" ]; then
+        CHAT_ID_VALUE=$(sudo -u "$SUDO_USER" gcloud secrets versions access latest --secret="$TELEGRAM_CHAT_ID_SECRET" --project="$PROJECT_ID" 2>/dev/null || echo "")
     else
-        read -p "Enter Telegram chat ID: " CHAT_ID
-        echo -n "$CHAT_ID" | gcloud secrets create "$TELEGRAM_CHAT_ID_SECRET" \
-            --data-file=- \
-            --project="$PROJECT_ID" \
-            --replication-policy="automatic"
-        log_info "Telegram chat ID secret created"
+        CHAT_ID_VALUE=$(gcloud secrets versions access latest --secret="$TELEGRAM_CHAT_ID_SECRET" --project="$PROJECT_ID" 2>/dev/null || echo "")
+    fi
+    if [ -n "$CHAT_ID_VALUE" ]; then
+        log_info "  Chat ID: $CHAT_ID_VALUE"
     fi
     
-    log_info "Telegram notifications configured successfully"
-    log_info "You will receive notifications for:"
-    log_info "  - Operation start"
-    log_info "  - Operation success/failure"
-    log_info "  - Daily log file"
-    log_info "  - Daily summary"
+    log_info "To update Telegram credentials later, run:"
+    log_info "  echo -n 'BOT_TOKEN' | gcloud secrets versions add $TELEGRAM_BOT_TOKEN_SECRET --data-file=- --project=$PROJECT_ID"
+    log_info "  echo -n 'CHAT_ID' | gcloud secrets versions add $TELEGRAM_CHAT_ID_SECRET --data-file=- --project=$PROJECT_ID"
 else
-    log_info "Skipping Telegram configuration. You can configure it later by running:"
-    log_info "  echo -n 'BOT_TOKEN' | gcloud secrets create $TELEGRAM_BOT_TOKEN_SECRET --data-file=- --project=$PROJECT_ID"
-    log_info "  echo -n 'CHAT_ID' | gcloud secrets create $TELEGRAM_CHAT_ID_SECRET --data-file=- --project=$PROJECT_ID"
+    read -p "Do you want to configure Telegram notifications? (y/N): " -n 1 -r
+    echo
+    if [[ $REPLY =~ ^[Yy]$ ]]; then
+        # Telegram Bot Token
+        if [ "$TELEGRAM_BOT_EXISTS" = true ]; then
+            log_info "Telegram bot token secret already exists"
+            read -p "Do you want to update it? (y/N): " -n 1 -r
+            echo
+            if [[ $REPLY =~ ^[Yy]$ ]]; then
+                read -p "Enter Telegram bot token: " BOT_TOKEN
+                if [ -n "${SUDO_USER:-}" ]; then
+                    sudo -u "$SUDO_USER" bash -c "echo -n '$BOT_TOKEN' | gcloud secrets versions add $TELEGRAM_BOT_TOKEN_SECRET --data-file=- --project=$PROJECT_ID"
+                else
+                    echo -n "$BOT_TOKEN" | gcloud secrets versions add "$TELEGRAM_BOT_TOKEN_SECRET" \
+                        --data-file=- \
+                        --project="$PROJECT_ID"
+                fi
+                log_info "Telegram bot token updated"
+            fi
+        else
+            read -p "Enter Telegram bot token: " BOT_TOKEN
+            if [ -n "${SUDO_USER:-}" ]; then
+                sudo -u "$SUDO_USER" bash -c "echo -n '$BOT_TOKEN' | gcloud secrets create $TELEGRAM_BOT_TOKEN_SECRET --data-file=- --project=$PROJECT_ID --replication-policy=automatic"
+            else
+                echo -n "$BOT_TOKEN" | gcloud secrets create "$TELEGRAM_BOT_TOKEN_SECRET" \
+                    --data-file=- \
+                    --project="$PROJECT_ID" \
+                    --replication-policy="automatic"
+            fi
+            log_info "Telegram bot token secret created"
+        fi
+        
+        # Telegram Chat ID
+        if [ "$TELEGRAM_CHAT_EXISTS" = true ]; then
+            log_info "Telegram chat ID secret already exists"
+            read -p "Do you want to update it? (y/N): " -n 1 -r
+            echo
+            if [[ $REPLY =~ ^[Yy]$ ]]; then
+                read -p "Enter Telegram chat ID: " CHAT_ID
+                if [ -n "${SUDO_USER:-}" ]; then
+                    sudo -u "$SUDO_USER" bash -c "echo -n '$CHAT_ID' | gcloud secrets versions add $TELEGRAM_CHAT_ID_SECRET --data-file=- --project=$PROJECT_ID"
+                else
+                    echo -n "$CHAT_ID" | gcloud secrets versions add "$TELEGRAM_CHAT_ID_SECRET" \
+                        --data-file=- \
+                        --project="$PROJECT_ID"
+                fi
+                log_info "Telegram chat ID updated"
+            fi
+        else
+            read -p "Enter Telegram chat ID: " CHAT_ID
+            if [ -n "${SUDO_USER:-}" ]; then
+                sudo -u "$SUDO_USER" bash -c "echo -n '$CHAT_ID' | gcloud secrets create $TELEGRAM_CHAT_ID_SECRET --data-file=- --project=$PROJECT_ID --replication-policy=automatic"
+            else
+                echo -n "$CHAT_ID" | gcloud secrets create "$TELEGRAM_CHAT_ID_SECRET" \
+                    --data-file=- \
+                    --project="$PROJECT_ID" \
+                    --replication-policy="automatic"
+            fi
+            log_info "Telegram chat ID secret created"
+        fi
+        
+        log_info "Telegram notifications configured successfully"
+        log_info "You will receive notifications for:"
+        log_info "  - Operation start"
+        log_info "  - Operation success/failure"
+        log_info "  - Daily log file"
+        log_info "  - Daily summary"
+    else
+        log_info "Skipping Telegram configuration. You can configure it later by running:"
+        log_info "  echo -n 'BOT_TOKEN' | gcloud secrets create $TELEGRAM_BOT_TOKEN_SECRET --data-file=- --project=$PROJECT_ID"
+        log_info "  echo -n 'CHAT_ID' | gcloud secrets create $TELEGRAM_CHAT_ID_SECRET --data-file=- --project=$PROJECT_ID"
+    fi
 fi
 
 # Grant Secret Manager access to VM service account
