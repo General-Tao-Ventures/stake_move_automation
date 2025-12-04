@@ -8,12 +8,15 @@ Runs at 8AM PST daily via systemd timer.
 import os
 import sys
 import logging
+import argparse
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
 import bittensor as bt
 from bittensor.utils.balance import Balance
+from bittensor_wallet import Wallet
+from bittensor_wallet.errors import KeyFileError, PasswordError
 from google.cloud import secretmanager
 
 from utils.telegram_notifier import TelegramNotifier
@@ -54,8 +57,9 @@ def log_summary(message: str):
     """Log a summary message"""
     logger.info(message)
     try:
+        current_time = datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S %Z')
         with open(SUMMARY_LOG, 'a') as f:
-            f.write(f"[{bt.utils.get_current_date()} {bt.utils.get_current_time()}] {message}\n")
+            f.write(f"[{current_time}] {message}\n")
     except Exception:
         pass
 
@@ -98,6 +102,85 @@ def get_telegram_credentials() -> tuple[Optional[str], Optional[str]]:
         return bot_token, chat_id
     except Exception:
         return None, None
+
+
+def ensure_wallet_password_cached(wallet: "bt.wallet", password_value: Optional[str] = None) -> None:
+    """Set wallet password in environment variables for keyfile unlocks."""
+    if not password_value:
+        return
+    
+    password = password_value.strip()
+    if not password:
+        return
+    
+    # Get keyfiles and set passwords in their expected environment variables
+    for attr in ("coldkey_file", "hotkey_file"):
+        try:
+            file_obj = getattr(wallet, attr, None)
+            if file_obj is None:
+                continue
+            
+            # Check if encrypted
+            try:
+                if not file_obj.exists_on_device() or not file_obj.is_encrypted():
+                    continue
+            except Exception:
+                continue
+            
+            # Get the environment variable name for this keyfile
+            env_attr = getattr(file_obj, "env_var_name", None)
+            if not env_attr:
+                continue
+            
+            if callable(env_attr):
+                try:
+                    env_var = env_attr()
+                except TypeError:
+                    env_var = None
+            else:
+                env_var = env_attr
+            
+            if not env_var:
+                continue
+            
+            env_var = str(env_var)
+            
+            # Set password in environment using keyfile's method if available
+            try:
+                file_obj.save_password_to_env(password)
+            except AttributeError:
+                # Fallback to direct environment variable setting
+                os.environ[env_var] = password
+            
+            logger.debug(f"Set password for {attr} in environment variable {env_var}")
+        except Exception as e:
+            logger.debug(f"Could not set password for {attr}: {e}")
+            continue
+
+
+def unlock_wallet(wallet: "bt.wallet") -> None:
+    """Unlock wallet with proper error handling"""
+    logger.debug(f"Attempting to unlock coldkey for wallet {wallet}")
+    try:
+        wallet.unlock_coldkey()
+        logger.debug("Coldkey unlocked successfully")
+    except PasswordError as err:
+        error_msg = f"Invalid coldkey password: {err}"
+        logger.error(f"ERROR: {error_msg}")
+        raise Exception(error_msg) from err
+    except KeyFileError as err:
+        error_msg = f"Coldkey file error: {err}"
+        logger.error(f"ERROR: {error_msg}")
+        raise Exception(error_msg) from err
+    
+    try:
+        logger.debug(f"Attempting to unlock hotkey for wallet {wallet}")
+        wallet.unlock_hotkey()
+        logger.debug("Hotkey unlocked successfully")
+    except PasswordError:
+        logger.warning("Hotkey password is invalid; continuing since coldkey suffices for staking extrinsics")
+    except KeyFileError:
+        logger.warning("Hotkey file missing or unreadable; continuing since coldkey suffices for staking extrinsics")
 
 
 def fetch_stake_amount(subtensor: bt.subtensor, coldkey_ss58: str, hotkey_ss58: str, netuid: int) -> Optional[Balance]:
@@ -175,20 +258,34 @@ Please check the logs for more details."""
 
     # Initialize bittensor components
     try:
+        # Create wallet config using argparse and bt.config()
+        parser = argparse.ArgumentParser()
+        Wallet.add_args(parser)
+        bt.subtensor.add_args(parser)
+        bt.logging.add_args(parser)
+        
+        # Parse with wallet name and hotkey
+        args = [
+            '--wallet.name', WALLET_NAME,
+            '--wallet.hotkey', 'default',  # Default hotkey name
+        ]
+        config = bt.config(parser, args=args)
+        
+        # Setup bittensor logging
+        bt.logging(config=config)
+        log("Bittensor logging configured")
+        
+        # Create wallet using bt.wallet factory function (not Wallet class directly)
+        wallet = bt.wallet(config=config)
+        log(f"Wallet created: {wallet}")
+        
         # Set password in environment for wallet unlock
-        os.environ['MINER_WALLET_PASSWORD'] = password
+        # The ensure_wallet_password_cached function will set it in the correct env vars
+        ensure_wallet_password_cached(wallet, password_value=password)
         
-        # Create wallet config
-        wallet_config = bt.wallet.config()
-        wallet_config.name = WALLET_NAME
-        wallet_config.hotkey = "default"  # Default hotkey name
-        
-        # Create wallet
-        wallet = bt.wallet(config=wallet_config)
-        
-        # Unlock wallet (will use MINER_WALLET_PASSWORD from environment)
+        # Unlock wallet with proper error handling
         try:
-            wallet.unlock_coldkey()
+            unlock_wallet(wallet)
             log("Wallet unlocked successfully")
         except Exception as e:
             error_msg = f"Failed to unlock wallet: {e}"
@@ -206,8 +303,8 @@ Error: {error_msg}"""
             
             sys.exit(1)
 
-        # Create subtensor connection
-        subtensor = bt.subtensor()
+        # Create subtensor connection using config
+        subtensor = bt.subtensor(config=config)
         log(f"Connected to subtensor network: {subtensor.network}")
         
         # Get coldkey address
