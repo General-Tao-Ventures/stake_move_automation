@@ -36,13 +36,20 @@ ENV_PATHS = [
     Path("/opt/stake-move-automation") / ".env",
     Path.cwd() / ".env",
 ]
+env_loaded = False
 for env_path in ENV_PATHS:
     if env_path.exists():
-        load_dotenv(env_path)
-        break
-else:
-    # Fallback to default location if none found
-    load_dotenv(Path("/opt/stake-move-automation") / ".env")
+        try:
+            load_dotenv(env_path)
+            env_loaded = True
+            break
+        except PermissionError:
+            # If we can't read this one, try the next
+            continue
+        except Exception as e:
+            # Log but continue trying other paths
+            print(f"Warning: Failed to load .env from {env_path}: {e}", file=sys.stderr)
+            continue
 
 # Setup logging
 LOG_DIR.mkdir(parents=True, exist_ok=True)

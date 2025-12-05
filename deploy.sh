@@ -303,11 +303,16 @@ EOF
     log_info ".env file created successfully"
 fi
 
-# Set proper permissions on .env file
-log_info "Setting permissions on .env file..."
-chmod 600 "$ENV_FILE"
-chown root:root "$ENV_FILE"
-log_info "✓ .env file permissions set to 600 (root:root)"
+# Set proper permissions on .env file (always ensure correct ownership)
+if [ -f "$ENV_FILE" ]; then
+    log_info "Setting permissions on .env file..."
+    chmod 600 "$ENV_FILE"
+    chown "$SERVICE_USER:$SERVICE_USER" "$ENV_FILE"
+    log_info "✓ .env file permissions set to 600 ($SERVICE_USER:$SERVICE_USER)"
+else
+    log_error ".env file not found at $ENV_FILE"
+    exit 1
+fi
 
 log_info ""
 log_info "To update the .env file later, edit it directly:"
