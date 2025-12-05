@@ -1,17 +1,14 @@
 #!/usr/bin/env bash
 # deploy.sh
 # ------------------------------------------------------------
-# Deployment script for GCP VM stake move automation
-# Sets up Secret Manager, installs dependencies, and configures systemd
+# Deployment script for stake move automation
+# Sets up .env file, installs dependencies, and configures systemd
 # ------------------------------------------------------------
 set -euo pipefail
 
 ############################ CONSTANTS ############################
-PROJECT_ID="${GCP_PROJECT_ID:-}"
-SECRET_NAME="stake-move-wallet-sn35-password"
-TELEGRAM_BOT_TOKEN_SECRET="stake-move-telegram-bot-token"
-TELEGRAM_CHAT_ID_SECRET="stake-move-telegram-chat-id"
 INSTALL_DIR="/opt/stake-move-automation"
+ENV_FILE="$INSTALL_DIR/.env"
 SERVICE_USER="${SERVICE_USER:-root}"
 ###################################################################
 
@@ -48,21 +45,8 @@ check_command() {
 }
 
 log_info "Checking prerequisites..."
-check_command "gcloud" || exit 1
 check_command "python3" || log_warn "python3 not found, will install"
 check_command "pip3" || log_warn "pip3 not found, will install"
-
-# Get GCP project ID if not set
-if [ -z "$PROJECT_ID" ]; then
-    PROJECT_ID=$(gcloud config get-value project 2>/dev/null || echo "")
-    if [ -z "$PROJECT_ID" ]; then
-        log_error "GCP_PROJECT_ID not set and unable to get from gcloud config"
-        log_info "Please set GCP_PROJECT_ID environment variable or run: gcloud config set project YOUR_PROJECT_ID"
-        exit 1
-    fi
-fi
-
-log_info "Using GCP Project: $PROJECT_ID"
 
 # Install dependencies
 log_info "Installing system dependencies..."
@@ -163,7 +147,7 @@ if [ -f "$INSTALL_DIR/requirements.txt" ]; then
     fi
 else
     log_warn "requirements.txt not found. Installing basic dependencies..."
-    sudo -u "$SERVICE_USER" $PIP_CMD bittensor google-cloud-secret-manager requests 2>&1 | tee /tmp/pip_install.log || log_warn "Some dependencies may have failed to install"
+    sudo -u "$SERVICE_USER" $PIP_CMD bittensor python-dotenv requests 2>&1 | tee /tmp/pip_install.log || log_warn "Some dependencies may have failed to install"
 fi
 
 # Copy systemd files
@@ -179,8 +163,6 @@ if [ -z "${SERVICE_USER:-}" ]; then
         if [ -z "$SERVICE_USER" ]; then
             SERVICE_USER="root"
             log_warn "Could not determine non-root user, service will run as root"
-            log_warn "You may need to set up Application Default Credentials for root:"
-            log_warn "  sudo gcloud auth application-default login"
         fi
     fi
 fi
@@ -219,21 +201,6 @@ if [ -n "$USER_HOME" ] && [ "$SERVICE_USER" != "root" ]; then
     log_info "Updated PATH in service file to include $USER_HOME/.local/bin"
 fi
 
-# Set up Application Default Credentials path if not root
-if [ "$SERVICE_USER" != "root" ]; then
-    USER_HOME=$(getent passwd "$SERVICE_USER" | cut -d: -f6)
-    ADC_PATH="$USER_HOME/.config/gcloud/application_default_credentials.json"
-    if [ -f "$ADC_PATH" ]; then
-        log_info "Found Application Default Credentials for $SERVICE_USER"
-        # Set environment variable in service file
-        sed -i "/^Environment=/a Environment=\"GOOGLE_APPLICATION_CREDENTIALS=$ADC_PATH\"" /etc/systemd/system/stake-move.service
-    else
-        log_warn "Application Default Credentials not found for $SERVICE_USER"
-        log_warn "The service may fail to access secrets. Run as $SERVICE_USER:"
-        log_warn "  gcloud auth application-default login"
-    fi
-fi
-
 # Function to mask secret value for display
 mask_secret() {
     local secret="$1"
@@ -247,198 +214,104 @@ mask_secret() {
     fi
 }
 
-# Set up GCP Secret Manager
-log_info "Setting up GCP Secret Manager secret: $SECRET_NAME"
-
-# Check if secret exists (use the actual user's gcloud config, not root's)
-# Try to access the secret - if it works, it exists
-if sudo -u "$SUDO_USER" gcloud secrets describe "$SECRET_NAME" --project="$PROJECT_ID" &>/dev/null 2>&1 || \
-   gcloud secrets describe "$SECRET_NAME" --project="$PROJECT_ID" &>/dev/null 2>&1; then
-    log_info "Secret $SECRET_NAME already exists - skipping creation"
-    
-    # Try to retrieve and show masked value
-    SECRET_VALUE=""
-    if [ -n "${SUDO_USER:-}" ]; then
-        SECRET_VALUE=$(sudo -u "$SUDO_USER" gcloud secrets versions access latest --secret="$SECRET_NAME" --project="$PROJECT_ID" 2>/dev/null || echo "")
-    else
-        SECRET_VALUE=$(gcloud secrets versions access latest --secret="$SECRET_NAME" --project="$PROJECT_ID" 2>/dev/null || echo "")
-    fi
-    
-    if [ -n "$SECRET_VALUE" ]; then
-        MASKED=$(mask_secret "$SECRET_VALUE")
-        log_info "  Current value: $MASKED"
-    else
-        log_warn "  Could not retrieve secret value (may need permissions)"
-    fi
-    
-    log_info "To update the secret later, run:"
-    log_info "  echo -n 'NEW_PASSWORD' | gcloud secrets versions add $SECRET_NAME --data-file=- --project=$PROJECT_ID"
-else
-    log_info "Secret $SECRET_NAME does not exist"
-    read -p "Do you want to create it now? (y/N): " -n 1 -r
-    echo
-    if [[ $REPLY =~ ^[Yy]$ ]]; then
-        read -sp "Enter wallet password for $SECRET_NAME: " PASSWORD
-        echo
-        # Use the actual user's gcloud credentials
-        if [ -n "${SUDO_USER:-}" ]; then
-            sudo -u "$SUDO_USER" bash -c "echo -n '$PASSWORD' | gcloud secrets create $SECRET_NAME --data-file=- --project=$PROJECT_ID --replication-policy=automatic"
-        else
-            echo -n "$PASSWORD" | gcloud secrets create "$SECRET_NAME" \
-                --data-file=- \
-                --project="$PROJECT_ID" \
-                --replication-policy="automatic"
-        fi
-        log_info "Secret created successfully"
-    else
-        log_warn "Skipping secret creation. Make sure the secret exists before running the automation."
-    fi
-fi
-
-# Set up Telegram secrets (optional)
+# Set up .env file
 log_info ""
-log_info "Setting up Telegram notifications (optional)..."
+log_info "Setting up .env file..."
 
-# Check if Telegram secrets already exist
-TELEGRAM_BOT_EXISTS=false
-TELEGRAM_CHAT_EXISTS=false
-
-if (sudo -u "${SUDO_USER:-root}" gcloud secrets describe "$TELEGRAM_BOT_TOKEN_SECRET" --project="$PROJECT_ID" &>/dev/null 2>&1) || \
-   (gcloud secrets describe "$TELEGRAM_BOT_TOKEN_SECRET" --project="$PROJECT_ID" &>/dev/null 2>&1); then
-    TELEGRAM_BOT_EXISTS=true
-fi
-
-if (sudo -u "${SUDO_USER:-root}" gcloud secrets describe "$TELEGRAM_CHAT_ID_SECRET" --project="$PROJECT_ID" &>/dev/null 2>&1) || \
-   (gcloud secrets describe "$TELEGRAM_CHAT_ID_SECRET" --project="$PROJECT_ID" &>/dev/null 2>&1); then
-    TELEGRAM_CHAT_EXISTS=true
-fi
-
-if [ "$TELEGRAM_BOT_EXISTS" = true ] && [ "$TELEGRAM_CHAT_EXISTS" = true ]; then
-    log_info "Telegram secrets already exist - skipping configuration"
-    log_info "Bot token secret: $TELEGRAM_BOT_TOKEN_SECRET ✓"
-    
-    # Show masked bot token
-    BOT_TOKEN_VALUE=""
-    if [ -n "${SUDO_USER:-}" ]; then
-        BOT_TOKEN_VALUE=$(sudo -u "$SUDO_USER" gcloud secrets versions access latest --secret="$TELEGRAM_BOT_TOKEN_SECRET" --project="$PROJECT_ID" 2>/dev/null || echo "")
+if [ -f "$ENV_FILE" ]; then
+    log_info ".env file already exists at $ENV_FILE"
+    read -p "Do you want to update it? (y/N): " -n 1 -r
+    echo
+    if [[ ! $REPLY =~ ^[Yy]$ ]]; then
+        log_info "Keeping existing .env file"
+        # Show masked password if it exists
+        if grep -q "^WALLET_PASSWORD=" "$ENV_FILE" 2>/dev/null; then
+            PASSWORD_VALUE=$(grep "^WALLET_PASSWORD=" "$ENV_FILE" | cut -d'=' -f2-)
+            MASKED=$(mask_secret "$PASSWORD_VALUE")
+            log_info "  Current password: $MASKED"
+        fi
     else
-        BOT_TOKEN_VALUE=$(gcloud secrets versions access latest --secret="$TELEGRAM_BOT_TOKEN_SECRET" --project="$PROJECT_ID" 2>/dev/null || echo "")
+        # Update existing .env file
+        log_info "Updating .env file..."
+        # Backup existing file
+        cp "$ENV_FILE" "${ENV_FILE}.backup.$(date +%Y%m%d_%H%M%S)"
+        
+        # Prompt for wallet password
+        read -sp "Enter wallet password: " WALLET_PASSWORD
+        echo
+        
+        # Create new .env file
+        cat > "$ENV_FILE" << EOF
+# Wallet password for sn35 wallet (REQUIRED)
+WALLET_PASSWORD=$WALLET_PASSWORD
+EOF
+        
+        # Prompt for Telegram (optional)
+        read -p "Do you want to configure Telegram notifications? (y/N): " -n 1 -r
+        echo
+        if [[ $REPLY =~ ^[Yy]$ ]]; then
+            read -p "Enter Telegram bot token: " TELEGRAM_BOT_TOKEN
+            read -p "Enter Telegram chat ID: " TELEGRAM_CHAT_ID
+            cat >> "$ENV_FILE" << EOF
+
+# Telegram bot token (optional - for notifications)
+TELEGRAM_BOT_TOKEN=$TELEGRAM_BOT_TOKEN
+
+# Telegram chat ID (optional - for notifications)
+TELEGRAM_CHAT_ID=$TELEGRAM_CHAT_ID
+EOF
+        fi
+        
+        log_info ".env file updated"
     fi
-    if [ -n "$BOT_TOKEN_VALUE" ]; then
-        MASKED_BOT=$(mask_secret "$BOT_TOKEN_VALUE")
-        log_info "  Bot token: $MASKED_BOT"
-    fi
-    
-    log_info "Chat ID secret: $TELEGRAM_CHAT_ID_SECRET ✓"
-    
-    # Show chat ID (can show full value as it's not sensitive)
-    CHAT_ID_VALUE=""
-    if [ -n "${SUDO_USER:-}" ]; then
-        CHAT_ID_VALUE=$(sudo -u "$SUDO_USER" gcloud secrets versions access latest --secret="$TELEGRAM_CHAT_ID_SECRET" --project="$PROJECT_ID" 2>/dev/null || echo "")
-    else
-        CHAT_ID_VALUE=$(gcloud secrets versions access latest --secret="$TELEGRAM_CHAT_ID_SECRET" --project="$PROJECT_ID" 2>/dev/null || echo "")
-    fi
-    if [ -n "$CHAT_ID_VALUE" ]; then
-        log_info "  Chat ID: $CHAT_ID_VALUE"
-    fi
-    
-    log_info "To update Telegram credentials later, run:"
-    log_info "  echo -n 'BOT_TOKEN' | gcloud secrets versions add $TELEGRAM_BOT_TOKEN_SECRET --data-file=- --project=$PROJECT_ID"
-    log_info "  echo -n 'CHAT_ID' | gcloud secrets versions add $TELEGRAM_CHAT_ID_SECRET --data-file=- --project=$PROJECT_ID"
 else
+    # Create new .env file
+    log_info "Creating .env file at $ENV_FILE"
+    
+    # Prompt for wallet password (required)
+    read -sp "Enter wallet password: " WALLET_PASSWORD
+    echo
+    
+    if [ -z "$WALLET_PASSWORD" ]; then
+        log_error "Wallet password cannot be empty!"
+        exit 1
+    fi
+    
+    # Create .env file
+    cat > "$ENV_FILE" << EOF
+# Wallet password for sn35 wallet (REQUIRED)
+WALLET_PASSWORD=$WALLET_PASSWORD
+EOF
+    
+    # Prompt for Telegram (optional)
     read -p "Do you want to configure Telegram notifications? (y/N): " -n 1 -r
     echo
     if [[ $REPLY =~ ^[Yy]$ ]]; then
-        # Telegram Bot Token
-        if [ "$TELEGRAM_BOT_EXISTS" = true ]; then
-            log_info "Telegram bot token secret already exists"
-            read -p "Do you want to update it? (y/N): " -n 1 -r
-            echo
-            if [[ $REPLY =~ ^[Yy]$ ]]; then
-                read -p "Enter Telegram bot token: " BOT_TOKEN
-                if [ -n "${SUDO_USER:-}" ]; then
-                    sudo -u "$SUDO_USER" bash -c "echo -n '$BOT_TOKEN' | gcloud secrets versions add $TELEGRAM_BOT_TOKEN_SECRET --data-file=- --project=$PROJECT_ID"
-                else
-                    echo -n "$BOT_TOKEN" | gcloud secrets versions add "$TELEGRAM_BOT_TOKEN_SECRET" \
-                        --data-file=- \
-                        --project="$PROJECT_ID"
-                fi
-                log_info "Telegram bot token updated"
-            fi
-        else
-            read -p "Enter Telegram bot token: " BOT_TOKEN
-            if [ -n "${SUDO_USER:-}" ]; then
-                sudo -u "$SUDO_USER" bash -c "echo -n '$BOT_TOKEN' | gcloud secrets create $TELEGRAM_BOT_TOKEN_SECRET --data-file=- --project=$PROJECT_ID --replication-policy=automatic"
-            else
-                echo -n "$BOT_TOKEN" | gcloud secrets create "$TELEGRAM_BOT_TOKEN_SECRET" \
-                    --data-file=- \
-                    --project="$PROJECT_ID" \
-                    --replication-policy="automatic"
-            fi
-            log_info "Telegram bot token secret created"
-        fi
-        
-        # Telegram Chat ID
-        if [ "$TELEGRAM_CHAT_EXISTS" = true ]; then
-            log_info "Telegram chat ID secret already exists"
-            read -p "Do you want to update it? (y/N): " -n 1 -r
-            echo
-            if [[ $REPLY =~ ^[Yy]$ ]]; then
-                read -p "Enter Telegram chat ID: " CHAT_ID
-                if [ -n "${SUDO_USER:-}" ]; then
-                    sudo -u "$SUDO_USER" bash -c "echo -n '$CHAT_ID' | gcloud secrets versions add $TELEGRAM_CHAT_ID_SECRET --data-file=- --project=$PROJECT_ID"
-                else
-                    echo -n "$CHAT_ID" | gcloud secrets versions add "$TELEGRAM_CHAT_ID_SECRET" \
-                        --data-file=- \
-                        --project="$PROJECT_ID"
-                fi
-                log_info "Telegram chat ID updated"
-            fi
-        else
-            read -p "Enter Telegram chat ID: " CHAT_ID
-            if [ -n "${SUDO_USER:-}" ]; then
-                sudo -u "$SUDO_USER" bash -c "echo -n '$CHAT_ID' | gcloud secrets create $TELEGRAM_CHAT_ID_SECRET --data-file=- --project=$PROJECT_ID --replication-policy=automatic"
-            else
-                echo -n "$CHAT_ID" | gcloud secrets create "$TELEGRAM_CHAT_ID_SECRET" \
-                    --data-file=- \
-                    --project="$PROJECT_ID" \
-                    --replication-policy="automatic"
-            fi
-            log_info "Telegram chat ID secret created"
-        fi
-        
-        log_info "Telegram notifications configured successfully"
-        log_info "You will receive notifications for:"
-        log_info "  - Operation start"
-        log_info "  - Operation success/failure"
-        log_info "  - Daily log file"
-        log_info "  - Daily summary"
-    else
-        log_info "Skipping Telegram configuration. You can configure it later by running:"
-        log_info "  echo -n 'BOT_TOKEN' | gcloud secrets create $TELEGRAM_BOT_TOKEN_SECRET --data-file=- --project=$PROJECT_ID"
-        log_info "  echo -n 'CHAT_ID' | gcloud secrets create $TELEGRAM_CHAT_ID_SECRET --data-file=- --project=$PROJECT_ID"
+        read -p "Enter Telegram bot token: " TELEGRAM_BOT_TOKEN
+        read -p "Enter Telegram chat ID: " TELEGRAM_CHAT_ID
+        cat >> "$ENV_FILE" << EOF
+
+# Telegram bot token (optional - for notifications)
+TELEGRAM_BOT_TOKEN=$TELEGRAM_BOT_TOKEN
+
+# Telegram chat ID (optional - for notifications)
+TELEGRAM_CHAT_ID=$TELEGRAM_CHAT_ID
+EOF
+        log_info "Telegram notifications configured"
     fi
+    
+    log_info ".env file created successfully"
 fi
 
-# Grant Secret Manager access to VM service account
-log_info "Configuring service account permissions..."
-SERVICE_ACCOUNT_EMAIL=$(gcloud compute instances describe $(hostname) \
-    --zone=$(curl -s "http://metadata.google.internal/computeMetadata/v1/instance/zone" -H "Metadata-Flavor: Google" | cut -d/ -f4) \
-    --format="value(serviceAccounts[0].email)" 2>/dev/null || echo "")
+# Set proper permissions on .env file
+log_info "Setting permissions on .env file..."
+chmod 600 "$ENV_FILE"
+chown root:root "$ENV_FILE"
+log_info "✓ .env file permissions set to 600 (root:root)"
 
-if [ -n "$SERVICE_ACCOUNT_EMAIL" ]; then
-    log_info "VM service account: $SERVICE_ACCOUNT_EMAIL"
-    log_info "Granting Secret Manager Secret Accessor role..."
-    gcloud projects add-iam-policy-binding "$PROJECT_ID" \
-        --member="serviceAccount:$SERVICE_ACCOUNT_EMAIL" \
-        --role="roles/secretmanager.secretAccessor" \
-        --condition=None 2>/dev/null || log_warn "Failed to grant permissions. You may need to do this manually."
-else
-    log_warn "Could not determine VM service account. Please grant Secret Manager access manually:"
-    log_info "  gcloud projects add-iam-policy-binding $PROJECT_ID \\"
-    log_info "    --member='serviceAccount:YOUR_SERVICE_ACCOUNT@$PROJECT_ID.iam.gserviceaccount.com' \\"
-    log_info "    --role='roles/secretmanager.secretAccessor'"
-fi
+log_info ""
+log_info "To update the .env file later, edit it directly:"
+log_info "  sudo nano $ENV_FILE"
 
 # Reload systemd
 log_info "Reloading systemd daemon..."
