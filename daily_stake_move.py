@@ -6,6 +6,7 @@ Runs at 8AM PST daily via systemd timer.
 """
 
 import os
+import re
 import sys
 import logging
 import argparse
@@ -20,6 +21,7 @@ from bittensor_wallet.errors import KeyFileError, PasswordError
 from dotenv import load_dotenv
 
 from utils.telegram_notifier import TelegramNotifier
+from utils.sheets_logger import SheetsLogger
 
 # Constants
 ORIGIN_NETUID = 35
@@ -28,6 +30,31 @@ ORIGIN_HOTKEY = "5EsmkLf4VnpgNM31syMjAWsUrQdW2Yu5xzWbv6oDQydP9vVx"
 DEST_HOTKEY = "5CATQqY6rA26Kkvm2abMTRtxnwyxigHZKxNJq86bUcpYsn35"
 WALLET_NAME = "sn35"
 LOG_DIR = Path("/var/log/stake-move")
+MINIMUM_STAKE_THRESHOLD = 0.001  # α — below this, nothing worth sweeping
+
+
+class _BittensorErrorCapture(logging.Handler):
+    """Temporary handler that captures bittensor log messages during move_stake."""
+
+    def __init__(self):
+        super().__init__()
+        self.records: list[str] = []
+
+    def emit(self, record: logging.LogRecord):
+        msg = record.getMessage()
+        # Strip Rich markup tags like [red], [/red], :cross_mark: etc.
+        msg = re.sub(r':\w+:', '', msg)
+        msg = re.sub(r'\[/?[a-zA-Z_0-9 ]+\]', '', msg).strip()
+        if msg:
+            self.records.append(msg)
+
+    def best_error(self) -> str:
+        """Return the most informative error line captured."""
+        # Prefer lines that mention the actual subtensor error
+        for msg in self.records:
+            if any(kw in msg for kw in ('error', 'Error', 'Failed', 'failed', 'AmountToo', 'returned')):
+                return msg
+        return self.records[-1] if self.records else ""
 
 # Load environment variables from .env file
 # Try multiple locations: script directory, /opt/stake-move-automation, current directory
@@ -88,6 +115,21 @@ def get_telegram_credentials() -> tuple[Optional[str], Optional[str]]:
     bot_token = os.environ.get('TELEGRAM_BOT_TOKEN')
     chat_id = os.environ.get('TELEGRAM_CHAT_ID')
     return bot_token, chat_id
+
+
+def init_sheets_logger() -> Optional[SheetsLogger]:
+    """Initialize Google Sheets logger from environment variables."""
+    sa_json = os.environ.get('GOOGLE_SERVICE_ACCOUNT_JSON')
+    sheet_id = os.environ.get('GOOGLE_SHEET_ID')
+    if not sa_json or not sheet_id:
+        log("Google Sheets credentials not configured, skipping sheet logging")
+        return None
+    sheets = SheetsLogger(sa_json_path=sa_json, sheet_id=sheet_id)
+    if sheets.connect():
+        log("Google Sheets logging enabled")
+        return sheets
+    log("Warning: Google Sheets connection failed, continuing without sheet logging")
+    return None
 
 
 def ensure_wallet_password_cached(wallet: "bt.wallet", password_value: Optional[str] = None) -> None:
@@ -206,16 +248,20 @@ def main():
     except Exception as e:
         log(f"Warning: Failed to initialize Telegram notifier: {e}")
 
-    # Send start notification
+    # Initialize Google Sheets logger
+    sheets_logger: Optional[SheetsLogger] = None
+    try:
+        sheets_logger = init_sheets_logger()
+    except Exception as e:
+        log(f"Warning: Failed to initialize Sheets logger: {e}")
+
+    # Send start notification (minimal — success/fail message provides the detail)
     if telegram_notifier:
         current_time = datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S %Z')
-        start_msg = f"""🚀 <b>Daily Stake Move Started</b>
-
-Date: {current_time}
-Origin Hotkey: <code>{ORIGIN_HOTKEY}</code>
-Destination Hotkey: <code>{DEST_HOTKEY}</code>
-Wallet: {WALLET_NAME}"""
-        telegram_notifier.send_message(start_msg)
+        telegram_notifier.send_message(
+            f"⏳ <b>Daily Sweep Running</b>  —  {current_time}\n"
+            f"Wallet: {WALLET_NAME}  |  Network: SN{ORIGIN_NETUID}"
+        )
 
     # Get password from environment variable
     log("Reading password from environment variable...")
@@ -280,13 +326,15 @@ Please check the logs for more details."""
             
             if telegram_notifier:
                 current_time = datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S %Z')
-                telegram_msg = f"""❌ <b>Stake Move Failed</b>
-
-Date: {current_time}
-Error: {error_msg}"""
-                telegram_notifier.send_message(telegram_msg)
+                telegram_notifier.send_message(
+                    f"❌ <b>Sweep Failed — Wallet Unlock Error</b>\n\n"
+                    f"⏱ {current_time}\n\n"
+                    f"🔴 <b>Error</b>\n"
+                    f"   <code>{error_msg}</code>\n\n"
+                    f"Check the wallet password in <code>.env</code>."
+                )
                 telegram_notifier.record_stake_move_failure()
-            
+
             sys.exit(1)
 
         # Create subtensor connection using config
@@ -301,26 +349,59 @@ Error: {error_msg}"""
         log("Fetching initial stake amounts...")
         origin_stake_before = fetch_stake_amount(subtensor, coldkey_ss58, ORIGIN_HOTKEY, ORIGIN_NETUID)
         dest_stake_before = fetch_stake_amount(subtensor, coldkey_ss58, DEST_HOTKEY, DEST_NETUID)
-        
-        if origin_stake_before:
-            log(f"Origin stake before move: {origin_stake_before.tao:.9f} α")
-        if dest_stake_before:
-            log(f"Destination stake before move: {dest_stake_before.tao:.9f} α")
+
+        origin_tao = origin_stake_before.tao if origin_stake_before else 0.0
+        dest_tao = dest_stake_before.tao if dest_stake_before else 0.0
+
+        log(f"Origin stake: {origin_tao:.9f} α")
+        log(f"Destination stake: {dest_tao:.9f} α")
+
+        # ---------------------------------------------------------------
+        # Pre-check: skip if nothing to sweep
+        # ---------------------------------------------------------------
+        if origin_tao < MINIMUM_STAKE_THRESHOLD:
+            skip_msg = (
+                f"Nothing to sweep — origin has {origin_tao:.9f} α "
+                f"(below threshold of {MINIMUM_STAKE_THRESHOLD} α)"
+            )
+            log(skip_msg)
+            log_summary(f"SKIPPED: {skip_msg}")
+
+            if telegram_notifier:
+                sheet_url = sheets_logger.sheet_url if sheets_logger else ""
+                sheet_line = f'\n\n👉 <a href="{sheet_url}">View Sheet</a>' if sheet_url else ""
+                telegram_notifier.send_message(
+                    f"ℹ️ <b>Nothing to Sweep — {datetime.now(timezone.utc).strftime('%b %d, %Y')}</b>\n\n"
+                    f"Origin stake:  <b>0.0000 α</b>  (not accumulated yet)\n"
+                    f"Accumulated:   <b>{dest_tao:,.4f} α</b>  in destination\n\n"
+                    f"The subnet hasn't emitted new stake to the origin hotkey yet. "
+                    f"This is normal — try again tomorrow.{sheet_line}"
+                )
+            return  # clean exit — not an error
 
         # Perform stake move
         log("Executing stake move operation...")
         try:
-            success = subtensor.move_stake(
-                wallet=wallet,
-                origin_hotkey=ORIGIN_HOTKEY,
-                origin_netuid=ORIGIN_NETUID,
-                destination_hotkey=DEST_HOTKEY,
-                destination_netuid=DEST_NETUID,
-                move_all_stake=True,
-            )
-            
+            # Attach a temporary handler to capture bittensor's internal error output
+            bt_capture = _BittensorErrorCapture()
+            root_log = logging.getLogger()
+            root_log.addHandler(bt_capture)
+            try:
+                success = subtensor.move_stake(
+                    wallet=wallet,
+                    origin_hotkey=ORIGIN_HOTKEY,
+                    origin_netuid=ORIGIN_NETUID,
+                    destination_hotkey=DEST_HOTKEY,
+                    destination_netuid=DEST_NETUID,
+                    move_all_stake=True,
+                )
+            finally:
+                root_log.removeHandler(bt_capture)
+
             if not success:
-                raise Exception("move_stake returned False")
+                captured = bt_capture.best_error()
+                detail = f" — {captured}" if captured else ""
+                raise Exception(f"move_stake returned False{detail}")
             
             log("Stake move operation completed successfully")
             
@@ -348,35 +429,95 @@ Error: {error_msg}"""
             log_summary(f"  Stake moved: {amount_moved:.9f} α")
             if dest_stake_after:
                 log_summary(f"  Destination total: {dest_stake_after.tao:.9f} α")
-            
+
+            # -------------------------------------------------------
+            # Google Sheets: log the sweep
+            # -------------------------------------------------------
+            if sheets_logger and amount_moved > 0:
+                try:
+                    sheets_logger.log_daily_sweep(
+                        timestamp=datetime.now(timezone.utc),
+                        amount=amount_moved,
+                    )
+                except Exception as e:
+                    log(f"Warning: Failed to log sweep to sheets: {e}")
+
+            # -------------------------------------------------------
+            # Google Sheets: check if distribution is due today
+            # -------------------------------------------------------
+            if sheets_logger:
+                try:
+                    is_due, period_start, period_end = sheets_logger.check_distribution_due()
+                    if is_due:
+                        current_balance = sheets_logger.get_current_balance()
+                        cfg = sheets_logger.config
+                        gtv_share = cfg.get("gtv_share", 0.5)
+                        ptn_share = cfg.get("ptn_share", 0.5)
+                        gtv_amount = current_balance * gtv_share
+                        ptn_amount = current_balance * ptn_share
+
+                        # Log pending distribution row
+                        sheets_logger.log_distribution_pending(
+                            period_start=period_start,
+                            period_end=period_end,
+                            total_balance=current_balance,
+                            gtv_amount=gtv_amount,
+                            ptn_amount=ptn_amount,
+                        )
+
+                        # Send distribution alert via Telegram
+                        if telegram_notifier:
+                            telegram_notifier.send_distribution_alert(
+                                period_start=period_start,
+                                period_end=period_end,
+                                total_balance=current_balance,
+                                gtv_amount=gtv_amount,
+                                ptn_amount=ptn_amount,
+                                gtv_wallet=cfg.get("gtv_wallet", ""),
+                                ptn_wallet=cfg.get("ptn_wallet", ""),
+                                sheet_url=sheets_logger.sheet_url,
+                            )
+                        log(f"Distribution due: {current_balance:.4f} α → GTV {gtv_amount:.4f} | PTN {ptn_amount:.4f}")
+                except Exception as e:
+                    log(f"Warning: Distribution check failed: {e}")
+
+            # -------------------------------------------------------
+            # Google Sheets: check for overdue pending distributions (reminder)
+            # -------------------------------------------------------
+            if sheets_logger:
+                try:
+                    pending = sheets_logger.check_pending_reminder()
+                    if pending and telegram_notifier:
+                        telegram_notifier.send_distribution_reminder(
+                            pending_rows=pending,
+                            sheet_url=sheets_logger.sheet_url,
+                        )
+                except Exception as e:
+                    log(f"Warning: Pending reminder check failed: {e}")
+
             # Send success notification
             if telegram_notifier:
                 telegram_notifier.record_stake_move_success(amount_moved)
-                current_time = datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S %Z')
-                current_date = datetime.now(timezone.utc).strftime('%Y-%m-%d')
-                
-                # Build success message with stake details
-                dest_total_str = f"{dest_stake_after.tao:.9f} α" if dest_stake_after else "N/A (could not fetch)"
-                origin_after_str = f"{origin_stake_after.tao:.9f} α" if origin_stake_after else "0.000000000 α"
-                
-                success_msg = f"""✅ <b>Stake Move Completed Successfully</b>
 
-Date: {current_time}
-Stake Moved: <b>{amount_moved:.9f} α</b>
-Origin Stake After: {origin_after_str}
-Destination Total: <b>{dest_total_str}</b>
-Origin Hotkey: <code>{ORIGIN_HOTKEY}</code>
-Destination Hotkey: <code>{DEST_HOTKEY}</code>"""
-                telegram_notifier.send_message(success_msg)
-                
-                # Send log file
-                try:
-                    telegram_notifier.send_document(
-                        str(LOG_FILE),
-                        caption=f"Daily Stake Move Log - {current_date}"
+                # Fetch rich stats from sheet for the notification
+                stats = {}
+                if sheets_logger:
+                    try:
+                        stats = sheets_logger.get_sweep_stats(amount_moved)
+                    except Exception as e:
+                        log(f"Warning: Could not fetch sweep stats: {e}")
+
+                if stats:
+                    telegram_notifier.send_sweep_success(amount=amount_moved, stats=stats)
+                else:
+                    # Fallback to simple message if sheets not available
+                    current_time = datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S %Z')
+                    dest_total_str = f"{dest_stake_after.tao:.4f} α" if dest_stake_after else "N/A"
+                    telegram_notifier.send_message(
+                        f"✅ <b>Daily Sweep — {current_time}</b>\n\n"
+                        f"Swept: <b>{amount_moved:.4f} α</b>\n"
+                        f"Destination Total: <b>{dest_total_str}</b>"
                     )
-                except Exception:
-                    pass
             
             log("==========================================")
             log("Daily stake move operation completed")
@@ -386,18 +527,21 @@ Destination Hotkey: <code>{DEST_HOTKEY}</code>"""
             error_msg = f"Stake move operation failed: {e}"
             log(f"ERROR: {error_msg}")
             log_summary(f"FAILED: {error_msg}")
-            
+
             if telegram_notifier:
                 current_time = datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S %Z')
-                telegram_msg = f"""❌ <b>Stake Move Failed</b>
-
-Date: {current_time}
-Origin Hotkey: <code>{ORIGIN_HOTKEY}</code>
-Destination Hotkey: <code>{DEST_HOTKEY}</code>
-Error: {error_msg}
-
-Please check the logs for more details."""
-                telegram_notifier.send_message(telegram_msg)
+                sheet_url = sheets_logger.sheet_url if sheets_logger else ""
+                sheet_line = f'\n\n👉 <a href="{sheet_url}">View Sheet</a>' if sheet_url else ""
+                telegram_notifier.send_message(
+                    f"❌ <b>Sweep Failed — {datetime.now(timezone.utc).strftime('%b %d, %Y')}</b>\n\n"
+                    f"⏱ {current_time}\n\n"
+                    f"📉 <b>Stake at time of failure</b>\n"
+                    f"   Origin:       <b>{origin_tao:,.9f} α</b>\n"
+                    f"   Destination:  <b>{dest_tao:,.4f} α</b>\n\n"
+                    f"🔴 <b>Error</b>\n"
+                    f"   <code>{e}</code>\n\n"
+                    f"Check <code>/var/log/stake-move/</code> for full details.{sheet_line}"
+                )
                 telegram_notifier.record_stake_move_failure()
             
             sys.exit(1)
@@ -409,13 +553,15 @@ Please check the logs for more details."""
         
         if telegram_notifier:
             current_time = datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S %Z')
-            telegram_msg = f"""❌ <b>Stake Move Failed</b>
-
-Date: {current_time}
-Error: {error_msg}"""
-            telegram_notifier.send_message(telegram_msg)
+            telegram_notifier.send_message(
+                f"❌ <b>Sweep Failed — Initialisation Error</b>\n\n"
+                f"⏱ {current_time}\n\n"
+                f"🔴 <b>Error</b>\n"
+                f"   <code>{error_msg}</code>\n\n"
+                f"Check <code>/var/log/stake-move/</code> for full details."
+            )
             telegram_notifier.record_stake_move_failure()
-        
+
         sys.exit(1)
     
     finally:

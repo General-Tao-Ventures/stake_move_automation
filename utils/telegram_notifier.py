@@ -247,6 +247,161 @@ Branch: {self.git_branch}"""
         except Exception:
             pass  # Fail silently
 
+    def send_sweep_success(self, amount: float, stats: dict):
+        """
+        Rich daily sweep notification with accounting context.
+
+        stats keys (from SheetsLogger.get_sweep_stats()):
+          current_balance, period_day, cycle_days,
+          next_dist_date, days_until_dist,
+          avg_7d, projected_dist, gtv_projected, ptn_projected,
+          dashboard_url, distributions_url, daily_sweeps_url
+        """
+        if not self.enabled:
+            return
+        try:
+            from datetime import date as _date
+
+            def fmt(n: float) -> str:
+                return f"{n:,.4f}"
+
+            cycle = stats.get("cycle_days", 14)
+            period_day = stats.get("period_day", 1)
+            balance = stats.get("current_balance", 0.0)
+            avg_7d = stats.get("avg_7d", 0.0)
+            projected = stats.get("projected_dist", 0.0)
+            gtv_proj = stats.get("gtv_projected", 0.0)
+            ptn_proj = stats.get("ptn_projected", 0.0)
+            days_until = stats.get("days_until_dist", 0)
+            next_dist = stats.get("next_dist_date")
+            dashboard_url = stats.get("dashboard_url", "")
+            distributions_url = stats.get("distributions_url", "")
+            daily_sweeps_url = stats.get("daily_sweeps_url", "")
+
+            next_dist_str = next_dist.strftime("%b %d, %Y") if next_dist else "N/A"
+
+            # Period progress bar (5 chars wide)
+            filled = round((period_day / cycle) * 10)
+            bar = "█" * filled + "░" * (10 - filled)
+
+            # Projected line only shows if we have enough history
+            proj_line = (
+                f"   Projected dist:  <b>{fmt(projected)} α</b>\n"
+                if avg_7d > 0 else ""
+            )
+
+            # Build deep links
+            link_parts = []
+            if dashboard_url:
+                link_parts.append(f'<a href="{dashboard_url}">Dashboard</a>')
+            if daily_sweeps_url:
+                link_parts.append(f'<a href="{daily_sweeps_url}">Daily Sweeps</a>')
+            if distributions_url:
+                link_parts.append(f'<a href="{distributions_url}">Distributions</a>')
+            links_line = "  ·  ".join(link_parts)
+
+            message = (
+                f"✅ <b>Daily Sweep — {datetime.now(timezone.utc).strftime('%b %d, %Y')}</b>\n"
+                f"\n"
+                f"💰 <b>Today's Earnings</b>\n"
+                f"   <b>{fmt(amount)} α</b>  swept\n"
+                f"\n"
+                f"📊 <b>Period Progress</b>  (Day {period_day} of {cycle})\n"
+                f"   {bar}\n"
+                f"   Accumulated:  <b>{fmt(balance)} α</b>\n"
+                f"   7-day avg:     {fmt(avg_7d)} α / day\n"
+                f"{proj_line}"
+                f"\n"
+                f"🗓️ <b>Next Distribution</b>\n"
+                f"   {next_dist_str}  ({days_until}d away)\n"
+                f"   GTV: ~{fmt(gtv_proj)} α  |  PTN: ~{fmt(ptn_proj)} α\n"
+                f"\n"
+                f"👉 {links_line}"
+            )
+            self.send_message(message)
+        except Exception:
+            pass
+
+    def send_distribution_alert(
+        self,
+        period_start,
+        period_end,
+        total_balance: float,
+        gtv_amount: float,
+        ptn_amount: float,
+        gtv_wallet: str = "",
+        ptn_wallet: str = "",
+        sheet_url: str = "",
+    ):
+        """Send distribution day notification with amounts and sheet link."""
+        if not self.enabled:
+            return
+        try:
+            from datetime import date as _date
+            def fmt_date(d) -> str:
+                if isinstance(d, _date):
+                    return d.strftime("%b %d, %Y")
+                return str(d)
+
+            period_days = ""
+            try:
+                from datetime import datetime as _dt
+                if hasattr(period_start, "strftime"):
+                    delta = (period_end - period_start).days + 1
+                    period_days = f" ({delta} days)"
+            except Exception:
+                pass
+
+            gtv_short = f"{gtv_wallet[:6]}...{gtv_wallet[-4:]}" if len(gtv_wallet) > 10 else gtv_wallet
+            ptn_short = f"{ptn_wallet[:6]}...{ptn_wallet[-4:]}" if len(ptn_wallet) > 10 else ptn_wallet
+
+            sheet_line = f'\n\n👉 <a href="{sheet_url}">View Sheet &amp; add tx links</a>' if sheet_url else ""
+
+            message = (
+                f"📅 <b>Distribution Day — {fmt_date(period_end)}</b>\n"
+                f"\n"
+                f"Period: {fmt_date(period_start)} → {fmt_date(period_end)}{period_days}\n"
+                f"Current Balance: <b>{total_balance:,.4f} α</b>\n"
+                f"\n"
+                f"Split 50/50:\n"
+                f"  GTV → <b>{gtv_amount:,.4f} α</b>\n"
+                f"       <code>{gtv_wallet}</code>\n"
+                f"  PTN → <b>{ptn_amount:,.4f} α</b>\n"
+                f"       <code>{ptn_wallet}</code>\n"
+                f"{sheet_line}\n"
+                f"\nPlease complete the transfer and mark as Completed in the sheet."
+            )
+            self.send_message(message)
+        except Exception:
+            pass
+
+    def send_distribution_reminder(self, pending_rows: list, sheet_url: str = ""):
+        """Send a follow-up reminder for overdue pending distributions."""
+        if not self.enabled or not pending_rows:
+            return
+        try:
+            lines = ["⚠️ <b>Distribution Reminder</b>\n"]
+            for row in pending_rows:
+                dist_date = row.get("date", "?")
+                gtv = row.get("gtv", "?")
+                ptn = row.get("ptn", "?")
+                has_links = row.get("has_tx_links", False)
+
+                lines.append(f"Distribution Date: <b>{dist_date}</b>")
+                lines.append(f"  GTV: {gtv} α  |  PTN: {ptn} α")
+                if has_links:
+                    lines.append("  ✅ Tx links found — please mark as <b>Completed</b> in the sheet.")
+                else:
+                    lines.append("  ❌ Still PENDING — transfer not recorded yet.")
+                lines.append("")
+
+            if sheet_url:
+                lines.append(f'👉 <a href="{sheet_url}">Update sheet here</a>')
+
+            self.send_message("\n".join(lines))
+        except Exception:
+            pass
+
     def record_stake_move_success(self, amount_tao: float):
         """Record a successful stake move"""
         with self.daily_summary_lock:
