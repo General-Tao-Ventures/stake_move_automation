@@ -2,7 +2,7 @@
 
 Runs daily on a Linux VM (via systemd timer). Each run sweeps accumulated stake from an **origin hotkey** into a **destination hotkey**, logs every sweep to Google Sheets, and sends Telegram notifications — including alerts on bi-weekly distribution days.
 
-> Originally built for SN35 (GTV & PTN). Now fully configurable — zero hardcoded values.
+> Originally built for SN35. Now fully configurable — zero hardcoded values, any number of distribution partners.
 
 ---
 
@@ -24,7 +24,7 @@ systemd timer (8 AM local)
 |---|---|
 | Linux VM (Ubuntu 22.04+) | Any cloud provider works |
 | Python 3.10+ | Usually pre-installed |
-| `btcli` installed | `pip install bittensor` |
+| `btcli` installed | `pip install bittensor bittensor-cli` |
 | A Bittensor wallet on the VM | Cold-key + hot-keys already registered |
 | (Optional) Telegram bot | Create via [@BotFather](https://t.me/BotFather) |
 | (Optional) Google Sheet + service account | For sweep logging |
@@ -36,7 +36,7 @@ systemd timer (8 AM local)
 ### 1. Clone the repo on your VM
 
 ```bash
-sudo git clone https://github.com/your-org/stake-move-automation.git /opt/stake-move-automation
+git clone https://github.com/General-Tao-Ventures/stake_move_automation.git /opt/stake-move-automation
 cd /opt/stake-move-automation
 sudo pip3 install -r requirements.txt
 ```
@@ -45,7 +45,6 @@ sudo pip3 install -r requirements.txt
 
 ```bash
 sudo cp env.example .env
-sudo nano .env
 ```
 
 Fill in all values — there are four sections:
@@ -190,15 +189,28 @@ ssh user@your-vm "cd /opt/stake-move-automation && sudo git pull origin main && 
 |---|---|---|
 | `OPENING_BALANCE` | — | Starting TAO balance (numeric) |
 | `OPENING_DATE` | — | Date tracking began (`YYYY-MM-DD`) |
-| `GTV_NAME` | `GTV` | Partner A display name |
-| `GTV_SHARE` | `0.5` | Partner A share (0–1) |
-| `GTV_WALLET` | — | Partner A SS58 wallet address |
-| `PTN_NAME` | `PTN` | Partner B display name |
-| `PTN_SHARE` | `0.5` | Partner B share (0–1) |
-| `PTN_WALLET` | — | Partner B SS58 wallet address |
+| `PARTNER_COUNT` | `2` | Number of partners sharing distributions |
+| `PARTNER_N_NAME` | `PartnerN` | Display name for partner N (e.g. `PARTNER_1_NAME=GTV`) |
+| `PARTNER_N_SHARE` | equal split | Decimal share for partner N, e.g. `0.5` = 50% |
+| `PARTNER_N_WALLET` | — | SS58 wallet address for partner N |
 | `FIRST_DIST_DATE` | — | First distribution date (`YYYY-MM-DD`) |
 | `CYCLE_DAYS` | `14` | Days between distributions |
 | `ARCHIVE_TAB_NAMES` | _(empty)_ | Comma-separated legacy tab names to rename as `[Archive] …` |
+
+**Example for three partners:**
+```bash
+PARTNER_COUNT=3
+PARTNER_1_NAME=Alice
+PARTNER_1_SHARE=0.5
+PARTNER_1_WALLET=5ABC...
+PARTNER_2_NAME=Bob
+PARTNER_2_SHARE=0.3
+PARTNER_2_WALLET=5DEF...
+PARTNER_3_NAME=Carol
+PARTNER_3_SHARE=0.2
+PARTNER_3_WALLET=5GHI...
+```
+Shares should sum to `1.0`. The Distributions sheet will automatically gain one amount column and one Tx Link column per partner.
 
 ---
 
